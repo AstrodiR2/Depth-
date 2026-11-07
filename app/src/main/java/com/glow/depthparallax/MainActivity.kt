@@ -93,7 +93,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 val photo = decode(uri)
                 val res = DepthEstimator(this).estimate(photo)
                 val depth = DepthRefiner.refine(photo, res.depth)
-                gl.queueEvent { renderer.setImages(photo, depth) }
+                val ly = LayerBuilder.build(photo, depth)
+                gl.queueEvent { renderer.setImages(photo, ly.depth, ly.bgPhoto, ly.bgDepth, ly.mask) }
                 runOnUiThread {
                     status.text = "Готово: ${res.backend}, ${res.ms} мс\nНаклоняй телефон. Тап — центр."
                     pickBtn.isEnabled = true

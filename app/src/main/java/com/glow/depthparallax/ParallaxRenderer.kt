@@ -16,19 +16,17 @@ class ParallaxRenderer : GLSurfaceView.Renderer {
     @Volatile var tiltY = 0f   // -1..1
     @Volatile var strength = 0.04f
 
+    // порядок: photo, depth, bgPhoto, bgDepth, mask
     private val lock = Any()
-    private var pendingPhoto: Bitmap? = null
-    private var pendingDepth: Bitmap? = null
-    private var curPhoto: Bitmap? = null
-    private var curDepth: Bitmap? = null
+    private var pending: Array<Bitmap>? = null
+    private var cur: Array<Bitmap>? = null
     private var needUpload = false
 
     private var prog = 0
-    private val tex = IntArray(2)
+    private val tex = IntArray(5)
     private var locScale = 0
     private var locTilt = 0
-    private var locPhoto = 0
-    private var locDepth = 0
+    private val locSamplers = IntArray(5)
     private var vw = 1
     private var vh = 1
     private var imgAspect = 1f
@@ -38,8 +36,8 @@ class ParallaxRenderer : GLSurfaceView.Renderer {
             put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)); position(0)
         }
 
-    fun setImages(photo: Bitmap, depth: Bitmap) {
-        synchronized(lock) { pendingPhoto = photo; pendingDepth = depth }
+    fun setImages(photo: Bitmap, depth: Bitmap, bgPhoto: Bitmap, bgDepth: Bitmap, mask: Bitmap) {
+        synchronized(lock) { pending = arrayOf(photo, depth, bgPhoto, bgDepth, mask) }
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
@@ -47,10 +45,10 @@ class ParallaxRenderer : GLSurfaceView.Renderer {
         prog = link(VERT, FRAG)
         locScale = GLES20.glGetUniformLocation(prog, "uScale")
         locTilt = GLES20.glGetUniformLocation(prog, "uTilt")
-        locPhoto = GLES20.glGetUniformLocation(prog, "uPhoto")
-        locDepth = GLES20.glGetUniformLocation(prog, "uDepth")
-        GLES20.glGenTextures(2, tex, 0)
-        needUpload = curPhoto != null // контекст пересоздан — перезалить текстуры
+        val names = arrayOf("uPhoto", "uDepth", "uBg", "uBgDepth", "uMask")
+        for (i in 0 until 5) locSamplers[i] = GLES20.glGetUniformLocation(prog, names[i])
+        GLES20.glGenTextures(5, tex, 0)
+        needUpload = cur != null // контекст пересоздан — перезалить текстуры
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -61,22 +59,15 @@ class ParallaxRenderer : GLSurfaceView.Renderer {
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         synchronized(lock) {
-            if (pendingPhoto != null && pendingDepth != null) {
-                curPhoto = pendingPhoto; curDepth = pendingDepth
-                pendingPhoto = null; pendingDepth = null
-                needUpload = true
-            }
+            pending?.let { cur = it; pending = null; needUpload = true }
         }
-        val photo = curPhoto ?: return
-        val depth = curDepth ?: return
+        val imgs = cur ?: return
         if (needUpload) {
-            upload(tex[0], photo)
-            upload(tex[1], depth)
-            imgAspect = photo.width.toFloat() / photo.height
+            for (i in 0 until 5) upload(tex[i], imgs[i])
+            imgAspect = imgs[0].width.toFloat() / imgs[0].height
             needUpload = false
         }
 
-        // "cover": заполняем экран, лишнее обрезаем + запас под сдвиг
         val viewAspect = vw.toFloat() / vh
         var sx = 1f
         var sy = 1f
@@ -87,12 +78,11 @@ class ParallaxRenderer : GLSurfaceView.Renderer {
         GLES20.glUseProgram(prog)
         GLES20.glUniform2f(locScale, sx, sy)
         GLES20.glUniform2f(locTilt, tiltX * strength, tiltY * strength)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
-        GLES20.glUniform1i(locPhoto, 0)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[1])
-        GLES20.glUniform1i(locDepth, 1)
+        for (i in 0 until 5) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + i)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[i])
+            GLES20.glUniform1i(locSamplers[i], i)
+        }
 
         val aPos = GLES20.glGetAttribLocation(prog, "aPos")
         GLES20.glEnableVertexAttribArray(aPos)
@@ -139,19 +129,34 @@ class ParallaxRenderer : GLSurfaceView.Renderer {
                 gl_Position = vec4(aPos, 0.0, 1.0);
             }
         """
+        // Два слоя: объект (по маске) и достроенный фон. Каждый сдвигается по своей глубине.
         private const val FRAG = """
-            precision mediump float;
+            precision highp float;
             varying vec2 vUv;
             uniform sampler2D uPhoto;
             uniform sampler2D uDepth;
+            uniform sampler2D uBg;
+            uniform sampler2D uBgDepth;
+            uniform sampler2D uMask;
             uniform vec2 uTilt;
             void main() {
-                vec2 uv = vUv;
+                // объект: стартуем с предположения "близко", чтобы он корректно наезжал на фон
+                vec2 uf = clamp(vUv + uTilt * 0.5, 0.0, 1.0);
                 for (int i = 0; i < 3; i++) {
-                    float d = texture2D(uDepth, clamp(uv, 0.0, 1.0)).r;
-                    uv = vUv + uTilt * (d - 0.5);
+                    float d = texture2D(uDepth, uf).r;
+                    uf = clamp(vUv + uTilt * (d - 0.5), 0.0, 1.0);
                 }
-                gl_FragColor = texture2D(uPhoto, clamp(uv, 0.0, 1.0));
+                float a = texture2D(uMask, uf).r;
+                vec3 fg = texture2D(uPhoto, uf).rgb;
+
+                vec2 ub = vUv;
+                for (int i = 0; i < 2; i++) {
+                    float db = texture2D(uBgDepth, ub).r;
+                    ub = clamp(vUv + uTilt * (db - 0.5), 0.0, 1.0);
+                }
+                vec3 bg = texture2D(uBg, ub).rgb;
+
+                gl_FragColor = vec4(mix(bg, fg, a), 1.0);
             }
         """
     }
