@@ -38,9 +38,6 @@ class DepthEstimator(private val ctx: Context) {
     private fun run(photo: Bitmap, useNnapi: Boolean): Bitmap {
         val env = OrtEnvironment.getEnvironment()
         val so = OrtSession.SessionOptions()
-        so.addFreeDimensionOverrideByName("batch_size", 1)
-        so.addFreeDimensionOverrideByName("height", size.toLong())
-        so.addFreeDimensionOverrideByName("width", size.toLong())
         if (useNnapi) so.addNnapi(EnumSet.of(NNAPIFlags.USE_FP16)) else so.setIntraOpNumThreads(4)
 
         val session = env.createSession(modelBytes, so)
