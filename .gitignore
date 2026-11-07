@@ -3,4 +3,4 @@ build/
 local.properties
 *.iml
 .idea/
-app/src/main/assets/midas_small.tflite
+app/src/main/assets/zipdepth.onnx

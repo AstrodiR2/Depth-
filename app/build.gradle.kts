@@ -16,7 +16,7 @@ android {
     }
 
     androidResources {
-        noCompress += "tflite"
+        noCompress += "onnx"
     }
 
     compileOptions {
@@ -31,5 +31,5 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-ktx:1.9.0")
-    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.26.0")
 }
