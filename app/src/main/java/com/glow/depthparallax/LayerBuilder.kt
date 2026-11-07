@@ -1,190 +1,158 @@
 package com.glow.depthparallax
 
 import android.graphics.Bitmap
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
- * Делит фото на два слоя: объект (по маске из глубины) и фон.
- * Фон под объектом достраивается методом push-pull (заливка из соседних пикселей),
- * поэтому при наклоне на месте объекта открывается фон, а не растянутая картинка.
+ * Нарезает фото на N слоёв по глубине (от дальнего к ближнему).
+ *
+ * Слой j = "сцена без всего, что ближе слоя j", где скрытое достроено (push-pull).
+ * Альфа слоя j = 1 там, где глубина >= начала слоя (сам слой + всё ближе, это перекроют ближние слои).
+ * Каждый слой двигается со своей скоростью, и на месте ушедшего объекта виден достроенный фон.
  */
 object LayerBuilder {
 
-    class Layers(val depth: Bitmap, val bgPhoto: Bitmap, val bgDepth: Bitmap, val mask: Bitmap)
+    class Result(val bitmaps: List<Bitmap>, val shifts: FloatArray)
 
-    fun build(photo: Bitmap, depthBmp: Bitmap): Layers {
-        val w = depthBmp.width
-        val h = depthBmp.height
-        val n = w * h
-        val dpx = IntArray(n).also { depthBmp.getPixels(it, 0, w, 0, 0, w, h) }
-        val d = FloatArray(n) { (dpx[it] and 255) / 255f }
-
-        // 1. маска объекта: порог по Оцу + заливка дыр внутри объекта (блики хрома и т.п.)
-        val t = otsu(d).coerceIn(0.3f, 0.7f)
-        val band = 0.08f
-        val m = FloatArray(n) { smooth(t - band, t + band, d[it]) }
-        fillHoles(m, w, h)
-
-        // 2. глубина объекта: внутри маски не даём падать ниже порога, чтобы объект не "рвался"
-        val lift = min(1f, t + 0.1f)
-        val depthAdj = FloatArray(n) { val di = d[it]; di + (max(di, lift) - di) * m[it] }
-
-        // 3. фон: убираем объект (с запасом по краю) и достраиваем
-        val dil = dilate(m, w, h, 3)
-        val wgt = FloatArray(n) { 1f - min(1f, dil[it] * 3f) }
-
-        val small = Bitmap.createScaledBitmap(photo, w, h, true)
-        val spx = IntArray(n).also { small.getPixels(it, 0, w, 0, 0, w, h) }
-        if (small !== photo) small.recycle()
-        val data = FloatArray(n * 4)
-        for (i in 0 until n) {
-            val p = spx[i]
-            data[i * 4] = ((p shr 16) and 255) / 255f
-            data[i * 4 + 1] = ((p shr 8) and 255) / 255f
-            data[i * 4 + 2] = (p and 255) / 255f
-            data[i * 4 + 3] = d[i]
-        }
-        val filled = pushPull(data, wgt, w, h, 4)
-
-        // 4. полноразмерный фон: оригинал везде, кроме места под объектом
+    fun build(photo: Bitmap, depthBmp: Bitmap, n: Int): Result {
         val pw = photo.width
         val ph = photo.height
-        val ppx = IntArray(pw * ph).also { photo.getPixels(it, 0, pw, 0, 0, pw, ph) }
-        for (y in 0 until ph) {
-            val fy = (y + 0.5f) / ph * h - 0.5f
+        val aspect = pw.toDouble() / ph
+
+        // разрешение слоя: общий бюджет ~24 Мпикс на все слои
+        val px = min(24_000_000.0 / n, pw.toDouble() * ph)
+        val lh = min(ph, Math.round(sqrt(px / aspect)).toInt().coerceAtLeast(64))
+        val lw = min(pw, Math.round(aspect * lh).toInt().coerceAtLeast(64))
+        val total = lw * lh
+
+        val small = Bitmap.createScaledBitmap(photo, lw, lh, true)
+        val spx = IntArray(total).also { small.getPixels(it, 0, lw, 0, 0, lw, lh) }
+        if (small !== photo) small.recycle()
+        val rgb = FloatArray(total * 3)
+        for (i in 0 until total) {
+            val p = spx[i]
+            rgb[i * 3] = ((p shr 16) and 255) / 255f
+            rgb[i * 3 + 1] = ((p shr 8) and 255) / 255f
+            rgb[i * 3 + 2] = (p and 255) / 255f
+        }
+
+        // глубина в разрешение слоя (билинейно)
+        val dw = depthBmp.width
+        val dh = depthBmp.height
+        val dpx = IntArray(dw * dh).also { depthBmp.getPixels(it, 0, dw, 0, 0, dw, dh) }
+        val dsrc = FloatArray(dw * dh) { (dpx[it] and 255) / 255f }
+        val d = FloatArray(total)
+        for (y in 0 until lh) {
+            val fy = (y + 0.5f) / lh * dh - 0.5f
             val y0 = floor(fy).toInt()
             val ty = fy - y0
-            val ya = y0.coerceIn(0, h - 1)
-            val yb = (y0 + 1).coerceIn(0, h - 1)
-            for (x in 0 until pw) {
-                val fx = (x + 0.5f) / pw * w - 0.5f
+            val ya = y0.coerceIn(0, dh - 1)
+            val yb = (y0 + 1).coerceIn(0, dh - 1)
+            for (x in 0 until lw) {
+                val fx = (x + 0.5f) / lw * dw - 0.5f
                 val x0 = floor(fx).toInt()
                 val tx = fx - x0
-                val xa = x0.coerceIn(0, w - 1)
-                val xb = (x0 + 1).coerceIn(0, w - 1)
-                val i00 = ya * w + xa
-                val i10 = ya * w + xb
-                val i01 = yb * w + xa
-                val i11 = yb * w + xb
-                val w00 = (1 - tx) * (1 - ty)
-                val w10 = tx * (1 - ty)
-                val w01 = (1 - tx) * ty
-                val w11 = tx * ty
-                val a = min(1f, (dil[i00] * w00 + dil[i10] * w10 + dil[i01] * w01 + dil[i11] * w11) * 3f)
-                if (a <= 0.001f) continue
-                val p = ppx[y * pw + x]
-                var r = ((p shr 16) and 255) / 255f
-                var g = ((p shr 8) and 255) / 255f
-                var b = (p and 255) / 255f
-                val fr = filled[i00 * 4] * w00 + filled[i10 * 4] * w10 + filled[i01 * 4] * w01 + filled[i11 * 4] * w11
-                val fg = filled[i00 * 4 + 1] * w00 + filled[i10 * 4 + 1] * w10 + filled[i01 * 4 + 1] * w01 + filled[i11 * 4 + 1] * w11
-                val fb = filled[i00 * 4 + 2] * w00 + filled[i10 * 4 + 2] * w10 + filled[i01 * 4 + 2] * w01 + filled[i11 * 4 + 2] * w11
-                r += (fr - r) * a
-                g += (fg - g) * a
-                b += (fb - b) * a
-                ppx[y * pw + x] = (0xFF shl 24) or
-                    ((r * 255f).toInt().coerceIn(0, 255) shl 16) or
-                    ((g * 255f).toInt().coerceIn(0, 255) shl 8) or
-                    (b * 255f).toInt().coerceIn(0, 255)
+                val xa = x0.coerceIn(0, dw - 1)
+                val xb = (x0 + 1).coerceIn(0, dw - 1)
+                d[y * lw + x] =
+                    dsrc[ya * dw + xa] * (1 - tx) * (1 - ty) + dsrc[ya * dw + xb] * tx * (1 - ty) +
+                    dsrc[yb * dw + xa] * (1 - tx) * ty + dsrc[yb * dw + xb] * tx * ty
             }
         }
-        val bgPhoto = Bitmap.createBitmap(ppx, pw, ph, Bitmap.Config.ARGB_8888)
-        val bgDepth = gray(IntArray(n) { gv(filled[it * 4 + 3]) }, w, h)
-        val depth = gray(IntArray(n) { gv(depthAdj[it]) }, w, h)
-        val mask = gray(IntArray(n) { gv(m[it]) }, w, h)
-        return Layers(depth, bgPhoto, bgDepth, mask)
+
+        // нормируем глубину по 2%..98%, чтобы слои распределились по реальному диапазону сцены
+        val hist = IntArray(256)
+        for (v in d) hist[(v * 255f).toInt().coerceIn(0, 255)]++
+        var acc = 0
+        var lo = 0
+        var hi = 255
+        for (i in 0 until 256) { acc += hist[i]; if (acc >= total * 0.02f) { lo = i; break } }
+        acc = 0
+        for (i in 0 until 256) { acc += hist[i]; if (acc >= total * 0.98f) { hi = i; break } }
+        val loV = lo / 255f
+        val hiV = max(hi / 255f, loV + 0.05f)
+        for (i in 0 until total) d[i] = ((d[i] - loV) / (hiV - loV)).coerceIn(0f, 1f)
+
+        // пустые срезы глубины пропускаем (лишние проходы отрисовки)
+        val cnt = IntArray(n)
+        for (v in d) cnt[min(n - 1, (v * n).toInt())]++
+        val minCount = max(50, (total * 0.0005f).toInt())
+        val keep = (0 until n).filter { it == 0 || cnt[it] >= minCount }
+
+        val soft = min(0.03f, 0.35f / n)
+        val r = max(2, lw / 300)
+        val workers = (200_000_000.0 / (total * 35.0)).toInt().coerceIn(1, 4)
+
+        val pool = Executors.newFixedThreadPool(workers)
+        try {
+            val tasks = keep.map { j ->
+                Callable {
+                    val hole = FloatArray(total)
+                    if (j < n - 1) {
+                        val b1 = (j + 1f) / n
+                        for (i in 0 until total) hole[i] = smooth(b1 - soft, b1 + soft, d[i])
+                    }
+                    dilateInPlace(hole, lw, lh, r)
+                    for (i in 0 until total) hole[i] = 1f - min(1f, hole[i] * 3f)
+                    val filled = pushPull(rgb, hole, lw, lh, 3)
+
+                    val bj = j.toFloat() / n
+                    val out = IntArray(total)
+                    for (i in 0 until total) {
+                        val a = if (j == 0) 1f else smooth(bj - soft, bj + soft, d[i])
+                        out[i] = (gv(a) shl 24) or (gv(filled[i * 3]) shl 16) or
+                            (gv(filled[i * 3 + 1]) shl 8) or gv(filled[i * 3 + 2])
+                    }
+                    Bitmap.createBitmap(out, lw, lh, Bitmap.Config.ARGB_8888)
+                }
+            }
+            val bmps = pool.invokeAll(tasks).map { it.get() }
+            val shifts = FloatArray(keep.size) { (keep[it] + 0.5f) / n }
+            return Result(bmps, shifts)
+        } finally {
+            pool.shutdown()
+        }
     }
 
-    private fun gv(v: Float) = (v * 255f).toInt().coerceIn(0, 255)
-
-    private fun gray(g: IntArray, w: Int, h: Int): Bitmap {
-        val px = IntArray(g.size) { (0xFF shl 24) or (g[it] shl 16) or (g[it] shl 8) or g[it] }
-        return Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
-    }
+    private fun gv(v: Float) = (v * 255f + 0.5f).toInt().coerceIn(0, 255)
 
     private fun smooth(e0: Float, e1: Float, x: Float): Float {
         val t = ((x - e0) / (e1 - e0)).coerceIn(0f, 1f)
         return t * t * (3f - 2f * t)
     }
 
-    private fun otsu(d: FloatArray): Float {
-        val hist = IntArray(256)
-        for (v in d) hist[(v * 255f).toInt().coerceIn(0, 255)]++
-        val total = d.size.toFloat()
-        var sumAll = 0f
-        for (i in 0 until 256) sumAll += i * hist[i]
-        var sumB = 0f
-        var wB = 0f
-        var best = 0f
-        var bestT = 127
-        for (i in 0 until 256) {
-            wB += hist[i]
-            if (wB == 0f) continue
-            val wF = total - wB
-            if (wF == 0f) break
-            sumB += i * hist[i]
-            val mB = sumB / wB
-            val mF = (sumAll - sumB) / wF
-            val between = wB * wF * (mB - mF) * (mB - mF)
-            if (between > best) { best = between; bestT = i }
-        }
-        return bestT / 255f
-    }
-
-    /** Всё, что в маске не связано с краем кадра "не-объектом", считаем объектом (заливка дыр). */
-    private fun fillHoles(m: FloatArray, w: Int, h: Int) {
-        val n = w * h
-        val bin = BooleanArray(n) { m[it] > 0.5f }
-        val reach = BooleanArray(n)
-        val q = IntArray(n)
-        var head = 0
-        var tail = 0
-        fun seed(i: Int) { if (!bin[i] && !reach[i]) { reach[i] = true; q[tail++] = i } }
-        for (x in 0 until w) { seed(x); seed((h - 1) * w + x) }
-        for (y in 0 until h) { seed(y * w); seed(y * w + w - 1) }
-        while (head < tail) {
-            val i = q[head++]
-            val x = i % w
-            val y = i / w
-            if (x > 0) seed(i - 1)
-            if (x < w - 1) seed(i + 1)
-            if (y > 0) seed(i - w)
-            if (y < h - 1) seed(i + w)
-        }
-        for (i in 0 until n) if (!bin[i] && !reach[i]) m[i] = 1f
-    }
-
-    private fun dilate(src: FloatArray, w: Int, h: Int, r: Int): FloatArray {
-        val tmp = FloatArray(src.size)
+    private fun dilateInPlace(a: FloatArray, w: Int, h: Int, r: Int) {
+        val tmp = FloatArray(a.size)
         for (y in 0 until h) for (x in 0 until w) {
             var mx = 0f
-            for (k in -r..r) mx = max(mx, src[y * w + (x + k).coerceIn(0, w - 1)])
+            for (k in -r..r) mx = max(mx, a[y * w + (x + k).coerceIn(0, w - 1)])
             tmp[y * w + x] = mx
         }
-        val out = FloatArray(src.size)
         for (y in 0 until h) for (x in 0 until w) {
             var mx = 0f
             for (k in -r..r) mx = max(mx, tmp[(y + k).coerceIn(0, h - 1) * w + x])
-            out[y * w + x] = mx
+            a[y * w + x] = mx
         }
-        return out
     }
 
     private class Lvl(val w: Int, val h: Int, val c: FloatArray, val wt: FloatArray)
 
-    /** Push-pull: заполняет пиксели с весом 0 значениями из ближайших валидных. */
+    /** Push-pull: заполняет пиксели с весом 0 значениями ближайших валидных. Входные массивы не меняет. */
     private fun pushPull(col: FloatArray, wt: FloatArray, w: Int, h: Int, ch: Int): FloatArray {
         val levels = ArrayList<Lvl>()
         levels.add(Lvl(w, h, col.copyOf(), wt.copyOf()))
+        val sum = FloatArray(ch)
         while (levels.last().w > 1 || levels.last().h > 1) {
             val p = levels.last()
             val nw = (p.w + 1) / 2
             val nh = (p.h + 1) / 2
             val c = FloatArray(nw * nh * ch)
             val wn = FloatArray(nw * nh)
-            val sum = FloatArray(ch)
             for (y in 0 until nh) for (x in 0 until nw) {
                 var sw = 0f
                 var cnt = 0
